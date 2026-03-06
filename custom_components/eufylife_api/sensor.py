@@ -237,7 +237,14 @@ class EufyLifeDataUpdateCoordinator(DataUpdateCoordinator):
         # so we don't permanently exclude them via the after= filter.
         configured_customer_ids = set(self.entry.runtime_data.customer_ids)
         known_customer_ids = set(self._last_device_timestamps.keys())
-        missing_customers = configured_customer_ids - known_customer_ids
+        missing_from_timestamps = configured_customer_ids - known_customer_ids
+        # Also include customers who have a persisted timestamp but no actual data
+        # (e.g. a previous run found a record but couldn't extract weight from it)
+        customers_without_data = {
+            cid for cid in configured_customer_ids
+            if not self.data or cid not in self.data
+        }
+        missing_customers = missing_from_timestamps | customers_without_data
 
         if self._last_device_timestamps and not missing_customers:
             since_timestamp = min(self._last_device_timestamps.values()) + 1
@@ -252,7 +259,7 @@ class EufyLifeDataUpdateCoordinator(DataUpdateCoordinator):
             use_after_param = False
             if missing_customers:
                 _LOGGER.info(
-                    "Customer(s) %s have no recorded timestamp - fetching ALL historical data",
+                    "Customer(s) %s have no data - fetching ALL historical data",
                     [cid[:8] for cid in missing_customers],
                 )
             else:
@@ -524,9 +531,12 @@ class EufyLifeDataUpdateCoordinator(DataUpdateCoordinator):
                     )
                 else:
                     _LOGGER.debug(
-                        "Device record #%d for customer %s contains no usable measurement data",
+                        "Device record #%d for customer %s contains no usable measurement data. "
+                        "scale_data keys: %s, scale_data values: %s",
                         i,
                         customer_id[:8],
+                        list(scale_data.keys()),
+                        scale_data,
                     )
 
             except Exception as err:
