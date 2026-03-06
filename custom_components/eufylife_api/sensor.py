@@ -232,7 +232,14 @@ class EufyLifeDataUpdateCoordinator(DataUpdateCoordinator):
         # Use the earliest per-customer timestamp so no user's new data is missed.
         # By querying from the oldest known measurement, we ensure all users get
         # their latest data even when they measure at very different times.
-        if self._last_device_timestamps:
+        # If any configured customer is missing from our timestamps (e.g. their
+        # data was never successfully fetched), fall back to a full history fetch
+        # so we don't permanently exclude them via the after= filter.
+        configured_customer_ids = set(self.entry.runtime_data.customer_ids)
+        known_customer_ids = set(self._last_device_timestamps.keys())
+        missing_customers = configured_customer_ids - known_customer_ids
+
+        if self._last_device_timestamps and not missing_customers:
             since_timestamp = min(self._last_device_timestamps.values()) + 1
             use_after_param = True
             _LOGGER.info(
@@ -243,7 +250,13 @@ class EufyLifeDataUpdateCoordinator(DataUpdateCoordinator):
         else:
             since_timestamp = None
             use_after_param = False
-            _LOGGER.info("First run - fetching ALL historical device data (no timestamp filter)")
+            if missing_customers:
+                _LOGGER.info(
+                    "Customer(s) %s have no recorded timestamp - fetching ALL historical data",
+                    [cid[:8] for cid in missing_customers],
+                )
+            else:
+                _LOGGER.info("First run - fetching ALL historical device data (no timestamp filter)")
 
         headers = {
             "Host": "api.eufylife.com",
