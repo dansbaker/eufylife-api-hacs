@@ -28,9 +28,7 @@ from homeassistant.helpers.update_coordinator import (
 
 from .const import (
     API_BASE_URL,
-    CONF_DATA_LOOKBACK_DAYS,
     CONF_UPDATE_INTERVAL,
-    DEFAULT_DATA_LOOKBACK_DAYS,
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
     SENSOR_TYPES,
@@ -52,7 +50,10 @@ class EufyLifeDataUpdateCoordinator(DataUpdateCoordinator):
         self._update_count = 0
         self._last_successful_update = None
         self._consecutive_failures = 0
-        self._last_device_timestamp = None  # Track last measurement timestamp
+        # Per-customer last measurement timestamps; loaded from persisted entry data
+        # so they survive HA restarts and avoid a full history re-fetch every time.
+        persisted_timestamps = entry.data.get("device_timestamps", {})
+        self._last_device_timestamps: dict[str, int] = dict(persisted_timestamps)
 
         # Get update interval from config, fallback to default
         update_interval_seconds = entry.data.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)
@@ -195,7 +196,24 @@ class EufyLifeDataUpdateCoordinator(DataUpdateCoordinator):
                             last_update.strftime("%Y-%m-%d %H:%M:%S"),
                         )
 
-            return processed_device_data
+                # Field-level merge: only overwrite fields present in the new measurement.
+                # This preserves body composition metrics from a previous full measurement
+                # when the latest step only captured weight (e.g. app not connected).
+                merged_data = {k: dict(v) for k, v in self.data.items()} if self.data else {}
+                for cid, new_customer_data in processed_device_data.items():
+                    if cid in merged_data:
+                        merged_data[cid].update(new_customer_data)
+                    else:
+                        merged_data[cid] = new_customer_data
+
+                # Persist per-customer timestamps so they survive HA restarts,
+                # avoiding a full history re-fetch on every startup.
+                self.hass.config_entries.async_update_entry(
+                    self.entry,
+                    data={**self.entry.data, "device_timestamps": self._last_device_timestamps},
+                )
+
+                return merged_data
         else:
             # No new data available — preserve existing data to avoid "unknown" sensor state
             if self.data:
@@ -211,12 +229,14 @@ class EufyLifeDataUpdateCoordinator(DataUpdateCoordinator):
         """Fetch recent device data from EufyLife API."""
         data = self.entry.runtime_data
 
-        # Use last device timestamp if available, otherwise get ALL historical data
-        if self._last_device_timestamp:
-            since_timestamp = int(self._last_device_timestamp) + 1
+        # Use the earliest per-customer timestamp so no user's new data is missed.
+        # By querying from the oldest known measurement, we ensure all users get
+        # their latest data even when they measure at very different times.
+        if self._last_device_timestamps:
+            since_timestamp = min(self._last_device_timestamps.values()) + 1
             use_after_param = True
             _LOGGER.info(
-                "Fetching device data since last measurement: timestamp %d (%s)",
+                "Fetching device data since earliest customer timestamp: %d (%s)",
                 since_timestamp,
                 datetime.fromtimestamp(since_timestamp).strftime("%Y-%m-%d %H:%M:%S"),
             )
@@ -313,7 +333,7 @@ class EufyLifeDataUpdateCoordinator(DataUpdateCoordinator):
 
                         return actual_data
                     else:
-                        if self._last_device_timestamp:
+                        if self._last_device_timestamps:
                             _LOGGER.warning(
                                 "No new device data found since last measurement (%s). "
                                 "Take a new measurement on your scale to generate fresh data.",
@@ -340,19 +360,13 @@ class EufyLifeDataUpdateCoordinator(DataUpdateCoordinator):
     async def _process_device_data(self, device_data: list) -> dict[str, Any]:
         """Process device data into customer format."""
         processed_data = {}
-        latest_timestamp = self._last_device_timestamp
+        new_timestamps: dict[str, int] = {}
         total_measurements = len(device_data)
         earliest_timestamp = None
-        is_first_run = self._last_device_timestamp is None
+        is_first_run = not self._last_device_timestamps
 
-        if self._last_device_timestamp:
+        if self._last_device_timestamps:
             _LOGGER.info("Processing %d new device measurements", total_measurements)
-            _LOGGER.debug(
-                "Current last device timestamp: %s",
-                datetime.fromtimestamp(self._last_device_timestamp).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
-            )
         else:
             _LOGGER.info(
                 "Processing %d historical device measurements (first run - showing full history)",
@@ -380,8 +394,9 @@ class EufyLifeDataUpdateCoordinator(DataUpdateCoordinator):
                 if update_time:
                     try:
                         timestamp = datetime.fromtimestamp(update_time)
-                        if latest_timestamp is None or update_time > latest_timestamp:
-                            latest_timestamp = update_time
+                        current_ts = new_timestamps.get(customer_id)
+                        if current_ts is None or update_time > current_ts:
+                            new_timestamps[customer_id] = update_time
                         if earliest_timestamp is None or update_time < earliest_timestamp:
                             earliest_timestamp = update_time
                     except Exception as ts_err:
@@ -421,6 +436,11 @@ class EufyLifeDataUpdateCoordinator(DataUpdateCoordinator):
                 if bone_mass and isinstance(bone_mass, (int, float)):
                     customer_data["bone_mass"] = round(float(bone_mass), 2)
                     customer_data["device_bone_mass"] = True
+
+                target_weight = scale_data.get("target_weight")
+                if target_weight and isinstance(target_weight, (int, float)):
+                    customer_data["target_weight"] = round(target_weight / 10.0, 2)
+                    customer_data["device_target_weight"] = True
 
                 bmr = scale_data.get("bmr")
                 if bmr and isinstance(bmr, (int, float)):
@@ -500,24 +520,31 @@ class EufyLifeDataUpdateCoordinator(DataUpdateCoordinator):
                 _LOGGER.warning("Error processing device record #%d: %s", i, err)
                 continue
 
-        if latest_timestamp is not None:
-            self._last_device_timestamp = latest_timestamp
+        if new_timestamps:
+            for customer_id, ts in new_timestamps.items():
+                old_ts = self._last_device_timestamps.get(customer_id)
+                if old_ts is None or ts > old_ts:
+                    self._last_device_timestamps[customer_id] = ts
             _LOGGER.info(
-                "Updated last device timestamp to %s for next API call",
-                datetime.fromtimestamp(latest_timestamp).strftime("%Y-%m-%d %H:%M:%S"),
+                "Updated per-customer timestamps: %s",
+                {
+                    cid[:8]: datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+                    for cid, ts in self._last_device_timestamps.items()
+                },
             )
 
-        if earliest_timestamp is not None and is_first_run:
-            if earliest_timestamp != latest_timestamp:
+        if earliest_timestamp is not None and is_first_run and new_timestamps:
+            latest_ts = max(new_timestamps.values())
+            if earliest_timestamp != latest_ts:
                 _LOGGER.info(
                     "Historical data range: %s to %s",
                     datetime.fromtimestamp(earliest_timestamp).strftime("%Y-%m-%d %H:%M:%S"),
-                    datetime.fromtimestamp(latest_timestamp).strftime("%Y-%m-%d %H:%M:%S"),
+                    datetime.fromtimestamp(latest_ts).strftime("%Y-%m-%d %H:%M:%S"),
                 )
             else:
                 _LOGGER.info(
                     "Single historical measurement at: %s",
-                    datetime.fromtimestamp(latest_timestamp).strftime("%Y-%m-%d %H:%M:%S"),
+                    datetime.fromtimestamp(latest_ts).strftime("%Y-%m-%d %H:%M:%S"),
                 )
 
         _LOGGER.info(
@@ -552,9 +579,11 @@ class EufyLifeDataUpdateCoordinator(DataUpdateCoordinator):
         await super().async_request_refresh()
 
     def reset_device_timestamp(self) -> None:
-        """Reset the device timestamp to force full data reload on next update."""
-        self._last_device_timestamp = None
-        _LOGGER.info("Device timestamp reset - next update will use full lookback period")
+        """Reset all device timestamps to force a full history reload on next update."""
+        self._last_device_timestamps = {}
+        data = {k: v for k, v in self.entry.data.items() if k != "device_timestamps"}
+        self.hass.config_entries.async_update_entry(self.entry, data=data)
+        _LOGGER.info("Device timestamps reset - next update will fetch full history")
 
 
 async def async_setup_entry(

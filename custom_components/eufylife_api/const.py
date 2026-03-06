@@ -6,7 +6,6 @@ DOMAIN = "eufylife_api"
 CONF_EMAIL = "email"
 CONF_PASSWORD = "password"
 CONF_UPDATE_INTERVAL = "update_interval"
-CONF_DATA_LOOKBACK_DAYS = "data_lookback_days"
 
 # API constants
 API_BASE_URL = "https://api.eufylife.com"
@@ -18,9 +17,6 @@ USER_AGENT_VERSION = "3.3.7"
 
 # Default update interval in seconds (5 minutes)
 DEFAULT_UPDATE_INTERVAL = 300
-
-# Default data lookback period in days
-DEFAULT_DATA_LOOKBACK_DAYS = 30
 
 # Update interval options (in seconds)
 UPDATE_INTERVAL_OPTIONS = {
