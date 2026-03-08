@@ -215,13 +215,73 @@ class EufyLifeDataUpdateCoordinator(DataUpdateCoordinator):
 
                 return merged_data
         else:
-            # No new data available — preserve existing data to avoid "unknown" sensor state
+            # No new device data — try the customer endpoint as fallback
+            _LOGGER.info(
+                "No new device data available - trying customer endpoint as fallback"
+            )
+            customer_targets = await self._fetch_customer_data()
+            if customer_targets:
+                customer_data = self._process_customer_data(customer_targets)
+                if customer_data:
+                    # Check if the customer endpoint has newer data than what we have
+                    has_newer = False
+                    for cid, cdata in customer_data.items():
+                        new_update = cdata.get("last_update")
+                        existing_update = (
+                            self.data.get(cid, {}).get("last_update") if self.data else None
+                        )
+                        if new_update and (not existing_update or new_update > existing_update):
+                            has_newer = True
+                            _LOGGER.info(
+                                "Customer endpoint has newer data for %s: %s (was %s)",
+                                cid[:8],
+                                new_update.strftime("%Y-%m-%d %H:%M:%S"),
+                                existing_update.strftime("%Y-%m-%d %H:%M:%S")
+                                if existing_update
+                                else "None",
+                            )
+
+                    if has_newer:
+                        # Merge customer data into existing data
+                        merged_data = (
+                            {k: dict(v) for k, v in self.data.items()} if self.data else {}
+                        )
+                        for cid, new_cdata in customer_data.items():
+                            if cid in merged_data:
+                                merged_data[cid].update(new_cdata)
+                            else:
+                                merged_data[cid] = new_cdata
+
+                        # Update persisted timestamps from customer data
+                        for cid, cdata in customer_data.items():
+                            update_ts = cdata.get("last_update")
+                            if update_ts:
+                                epoch = int(update_ts.timestamp())
+                                old_ts = self._last_device_timestamps.get(cid)
+                                if old_ts is None or epoch > old_ts:
+                                    self._last_device_timestamps[cid] = epoch
+
+                        self.hass.config_entries.async_update_entry(
+                            self.entry,
+                            data={
+                                **self.entry.data,
+                                "device_timestamps": self._last_device_timestamps,
+                            },
+                        )
+
+                        _LOGGER.info(
+                            "Updated sensor data from customer endpoint for %d customers",
+                            len(customer_data),
+                        )
+                        return merged_data
+
+            # Neither endpoint had new data — preserve existing
             if self.data:
-                _LOGGER.info("No new device data available - preserving existing sensor data")
+                _LOGGER.info("No new data from any endpoint - preserving existing sensor data")
                 return self.data
             else:
                 _LOGGER.warning(
-                    "No device data available from API and no existing data to preserve"
+                    "No data available from any API endpoint and no existing data to preserve"
                 )
                 return {}
 
@@ -376,6 +436,121 @@ class EufyLifeDataUpdateCoordinator(DataUpdateCoordinator):
         except Exception as err:
             _LOGGER.debug("Error fetching device data: %s", err)
             return {}
+
+    async def _fetch_customer_data(self) -> dict[str, Any]:
+        """Fetch data from customer/all_target endpoint (fallback for stale device data).
+
+        This endpoint is what the EufyLife app uses and always has up-to-date data,
+        including WiFi-synced measurements that may not appear in /v1/device/data.
+        """
+        data = self.entry.runtime_data
+
+        headers = {
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "User-Agent": f"EufyLife-iOS-{USER_AGENT_VERSION}",
+            "Category": "Health",
+            "Language": "en",
+            "Timezone": "UTC",
+            "Country": "US",
+            "Token": data.access_token,
+            "Uid": data.user_id,
+        }
+
+        try:
+            start_time = time.time()
+
+            async with self.session.get(
+                f"{API_BASE_URL}/v1/customer/all_target",
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as response:
+                request_duration = time.time() - start_time
+
+                _LOGGER.debug(
+                    "Customer data request completed in %.2f seconds. Status: %d",
+                    request_duration,
+                    response.status,
+                )
+
+                if response.status == 200:
+                    target_data = await response.json()
+
+                    if (
+                        isinstance(target_data, dict)
+                        and target_data.get("res_code") == 1
+                    ):
+                        target_list = target_data.get("target_list", [])
+                        _LOGGER.info(
+                            "Customer endpoint returned %d targets",
+                            len(target_list),
+                        )
+                        return target_list
+                    else:
+                        _LOGGER.warning(
+                            "Customer endpoint returned error: res_code=%s, message='%s'",
+                            target_data.get("res_code") if isinstance(target_data, dict) else "N/A",
+                            target_data.get("message", "") if isinstance(target_data, dict) else str(target_data),
+                        )
+                        return {}
+                else:
+                    _LOGGER.warning(
+                        "Customer data request failed with status %d", response.status
+                    )
+                    return {}
+
+        except Exception as err:
+            _LOGGER.warning("Error fetching customer data: %s", err)
+            return {}
+
+    def _process_customer_data(self, target_list: list) -> dict[str, Any]:
+        """Process customer/all_target response into the same format as device data.
+
+        Returns dict keyed by customer_id with weight, body_fat, muscle_mass, etc.
+        """
+        processed = {}
+
+        for target in target_list:
+            customer_id = target.get("customer_id")
+            if not customer_id:
+                continue
+
+            customer_data = {}
+
+            raw_weight = target.get("current_weight", 0)
+            if raw_weight and isinstance(raw_weight, (int, float)):
+                customer_data["weight"] = round(raw_weight / 10.0, 2)
+
+            raw_body_fat = target.get("current_bodyfat", 0)
+            if raw_body_fat and isinstance(raw_body_fat, (int, float)):
+                customer_data["body_fat"] = round(float(raw_body_fat), 2)
+
+            raw_muscle_mass = target.get("current_muscle_mass", 0)
+            if raw_muscle_mass and isinstance(raw_muscle_mass, (int, float)):
+                customer_data["muscle_mass"] = round(float(raw_muscle_mass), 2)
+
+            raw_target_weight = target.get("target_weight", 0)
+            if raw_target_weight and isinstance(raw_target_weight, (int, float)):
+                customer_data["target_weight"] = round(raw_target_weight / 10.0, 2)
+
+            update_time = target.get("update_time")
+            if update_time:
+                try:
+                    customer_data["last_update"] = datetime.fromtimestamp(update_time)
+                except Exception:
+                    pass
+
+            if customer_data.get("weight"):
+                processed[customer_id] = customer_data
+                _LOGGER.debug(
+                    "Customer endpoint data for %s: weight=%s, body_fat=%s, update=%s",
+                    customer_id[:8],
+                    customer_data.get("weight"),
+                    customer_data.get("body_fat"),
+                    customer_data.get("last_update", "N/A"),
+                )
+
+        return processed
 
     async def _process_device_data(self, device_data: list) -> dict[str, Any]:
         """Process device data into customer format."""
